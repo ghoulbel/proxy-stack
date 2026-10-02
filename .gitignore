@@ -1,0 +1,15 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# TLS certificates / private keys
+letsencrypt/
+*.pem
+*.key
+*.crt
+
+# Backups of previous configs
+*.back
+*.bak
+*.old
