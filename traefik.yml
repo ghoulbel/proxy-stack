@@ -1,15 +1,61 @@
 log:
-  level: DEBUG
+  level: INFO
 
-accessLog: {}
+accessLog:
+  # Redact anything that could end up in a URL. Jellyfin and OpenWebUI both
+  # pass tokens as query params on some paths.
+  filters:
+    statusCodes:
+      - "400-499"
+  fields:
+    headers:
+      names:
+        User-Agent: redact
+        Authorization: drop
+        Cookie: drop
+    defaultMode: drop
+    names:
+      RequestMethod: keep
+      RequestHost: keep
+      RequestURI: keep
+      StatusCode: keep
+      Duration: keep
+      ServiceName: keep
+      ServiceURL: keep
+      ClientUsername: keep
 
 api:
   dashboard: true
+  # The dashboard is only reachable through the router below, which carries
+  # both basicAuth and the Authentik forward-auth middleware. Nothing serves
+  # it on a raw port.
+  #
+  # Tried and rejected: api.insecure=true with a per-entrypoint
+  # `entryPoints.<name>.api.dashboard` opt-in for the loopback `traefik`
+  # entrypoint. v3.7 has no `api` node under an entryPoint — it is a hard
+  # "field not found, node: api" and the container crash-loops. Do not retry
+  # without checking the v3.7 schema first.
+  insecure: false
+
+global:
+  checkNewVersion: false
+
+ping:
+  # Must be 0.0.0.0 inside the container: docker port publishing forwards to
+  # the container's eth0, never its loopback. Host-side safety comes from the
+  # 127.0.0.1:8082:8082 mapping in docker-compose.yaml.
+  entryPoint: traefik
 
 entryPoints:
+  traefik:
+    address: ":8082"
+    http:
+      aliasHeadersStrategy: delete
+
   web:
     address: ":80"
     http:
+      aliasHeadersStrategy: delete
       redirections:
         entryPoint:
           to: websecure
@@ -18,17 +64,48 @@ entryPoints:
 
   websecure:
     address: ":443"
+    # Traefik v3 moved this out of entryPoints.<name>.http to entryPoints.<name>.
+    forwardedHeaders:
+      # cloudflared terminates nothing here — it dials Traefik over TLS — but
+      # the request it forwards still carries X-Forwarded-Proto, and the
+      # Authentik outpost must be told to trust it.
+      insecure: false
+      trustedIPs:
+        - "127.0.0.0/8"
+        - "::1/128"
+    transport:
+      respondingTimeouts:
+        # Jellyfin streams and OpenWebUI hold long-lived responses; the default
+        # write timeout would cut them off mid-transfer.
+        readTimeout: 0s
+        writeTimeout: 0s
     http:
+      aliasHeadersStrategy: delete
       tls: {}
 
 providers:
   docker:
+    endpoint: "unix:///var/run/docker.sock"
     exposedByDefault: false
-    # network: traefik   # uncomment if you want to force it
+    # Only containers that joined the `proxy` network are candidates. This is
+    # what stops an app that forgot its labels from silently becoming public.
+    network: proxy
+    defaultRule: ""
 
 certificatesResolvers:
   le:
     acme:
       email: bel-g-stylas@hotmail.com
       storage: /letsencrypt/acme.json
-      tlsChallenge: {}
+      dnsChallenge:
+        # Cloudflare is the only DNS provider for ghoulhub.uk, and DNS-01 is the
+        # only challenge that works here: there is no inbound 80/443 to this
+        # host, so tlsChallenge cannot complete.
+        provider: cloudflare
+        resolvers:
+          - "1.1.1.1:53"
+          - "1.0.0.1:53"
+        # Traefik v3.7 removed the per-provider credential fields from the ACME
+        # schema; `apiToken` here is a hard "field not found" startup failure.
+        # The credential is read from the container's environment instead, so
+        # docker-compose must pass CF_DNS_API_TOKEN through from .env.

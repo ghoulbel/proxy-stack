@@ -1,27 +1,122 @@
 services:
   traefik:
-    image: traefik:latest
+    image: traefik:v3.7.13
     container_name: traefik
     ports:
       - "80:80"
       - "443:443"
+      # Ops only: health + API on loopback, never reachable from the LAN.
+      # This is what you curl to inspect routers/middlewares.
+      - "127.0.0.1:8082:8082"
     volumes:
       - "/var/run/docker.sock:/var/run/docker.sock:ro"
-      - "./traefik.yml:/etc/traefik/traefik.yml"
+      - "./traefik.yml:/etc/traefik/traefik.yml:ro"
       - "./letsencrypt:/letsencrypt"
+    environment:
+      # Read by the cloudflare DNS-01 provider. Never commit .env.
+      CF_DNS_API_TOKEN: ${CF_DNS_API_TOKEN}
+      # Basic-auth credentials for the dashboard router.
+      DASHBOARD_USER: ${DASHBOARD_USER}
+      DASHBOARD_PASSWORD_HASH: ${DASHBOARD_PASSWORD_HASH}
     networks:
-      - traefik
+      - proxy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "traefik", "healthcheck", "--ping"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.dashboard.rule=Host(`darklordvpn.ddns.net`) && (PathPrefix(`/dashboard`) || PathPrefix(`/api`))"
+      # Dashboard. Rule uses the live public domain; the previous
+      # darklordvpn.ddns.net host no longer resolves, so this router never
+      # matched anything.
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.ghoulhub.uk`)"
       - "traefik.http.routers.dashboard.entrypoints=websecure"
+      # Companion outpost router, priority 6 — must outrank the dashboard's own
+      # priority 5. Without it the OAuth callback that Authentik sends the
+      # browser back on is caught by the forward-auth middleware and loops.
+      - "traefik.http.routers.dashboard-outpost.rule=Host(`traefik.ghoulhub.uk`) && PathPrefix(`/outpost.goauthentik.io/`)"
+      - "traefik.http.routers.dashboard-outpost.entrypoints=websecure"
+      - "traefik.http.routers.dashboard-outpost.tls.certresolver=le"
+      - "traefik.http.routers.dashboard-outpost.priority=6"
+      - "traefik.http.routers.dashboard-outpost.service=authentik-outpost"
+      - "traefik.http.routers.dashboard-outpost.middlewares=security-headers,rate-limit"
+      # Real Let's Encrypt cert via DNS-01. DNS-01 (not tlsChallenge) because
+      # there is no inbound 80/443 from the internet — the only public path is
+      # the Cloudflare Tunnel. It works whether or not the DNS record is
+      # proxied, so the DNS-only LAN records get a publicly trusted cert too.
       - "traefik.http.routers.dashboard.tls.certresolver=le"
       - "traefik.http.routers.dashboard.service=api@internal"
-      # ← Remove these two lines completely:
-      # - "traefik.http.middlewares.dashboard-stripprefix.stripprefix.prefixes=/dashboard,/api"
-      # - "traefik.http.routers.dashboard.middlewares=dashboard-stripprefix"
+      - "traefik.http.routers.dashboard.priority=5"
+      - "traefik.http.routers.dashboard.middlewares=authentik-forwardauth,dashboard-auth,security-headers,rate-limit"
+      # The dashboard is exposed through the public Cloudflare Tunnel so it is
+      # reachable from anywhere without per-device DNS overrides. That makes
+      # forward-auth mandatory, not optional: basic auth alone would be the only
+      # thing standing between the internet and the full router/middleware API.
+      # forwardauth runs first so an anonymous visitor gets the SSO login rather
+      # than a password prompt for an account they do not have yet.
+      - "traefik.http.middlewares.dashboard-auth.basicauth.users=${DASHBOARD_USER}:${DASHBOARD_PASSWORD_HASH}"
+
+      # ── Shared middlewares ────────────────────────────────────────────────
+      # These MUST be labels on a docker-provider container, not static config.
+      # A router created from docker labels resolves a bare middleware name
+      # against its own provider namespace, so `security-headers` means
+      # `security-headers@docker`. Defining them in traefik.yml puts them in
+      # the file provider instead and every reference fails at request time
+      # with `middleware "security-headers@docker" does not exist`.
+      - "traefik.http.middlewares.security-headers.headers.stsSeconds=31536000"
+      - "traefik.http.middlewares.security-headers.headers.stsIncludeSubdomains=true"
+      - "traefik.http.middlewares.security-headers.headers.stsPreload=true"
+      - "traefik.http.middlewares.security-headers.headers.contentTypeNosniff=true"
+      - "traefik.http.middlewares.security-headers.headers.frameDeny=true"
+      - "traefik.http.middlewares.security-headers.headers.referrerPolicy=no-referrer"
+      - "traefik.http.middlewares.security-headers.headers.customResponseHeaders.Server="
+      - "traefik.http.middlewares.security-headers.headers.customResponseHeaders.X-Powered-By="
+      - "traefik.http.middlewares.rate-limit.rateLimit.average=60"
+      - "traefik.http.middlewares.rate-limit.rateLimit.burst=100"
+      - "traefik.http.middlewares.rate-limit.rateLimit.period=1m"
+
+      # ── Authentik forward-auth ─────────────────────────────────────────────
+      # The embedded outpost lives inside the authentik-server container, so
+      # there is no separate proxy container to point at. `authentik-server`
+      # resolves on the `proxy` network, which is the only reason the server
+      # joins that network at all.
+      #
+      # trustForwardHeader is required: Authentik needs the original scheme and
+      # Host to build the redirect back to the app. Without it every login
+      # bounces to http:// and the flow deadlocks.
+      - "traefik.http.middlewares.authentik-forwardauth.forwardauth.address=http://authentik-server:9000/outpost.goauthentik.io/auth/traefik"
+      - "traefik.http.middlewares.authentik-forwardauth.forwardauth.trustForwardHeader=true"
+      - "traefik.http.middlewares.authentik-forwardauth.forwardauth.maxResponseBodySize=4194304"
+      - "traefik.http.middlewares.authentik-forwardauth.forwardauth.authResponseHeaders=X-authentik-username,X-authentik-groups,X-authentik-entitlements,X-authentik-email,X-authentik-name,X-authentik-uid,X-authentik-jwt,X-authentik-meta-jwks,X-authentik-meta-outpost,X-authentik-meta-provider,X-authentik-meta-app,X-authentik-meta-version"
+      # Per-app outpost endpoint. Every app router needs a companion router at
+      # a HIGHER priority that sends /outpost.goauthentik.io/ here instead of
+      # to the app — without it the callback is caught by the auth middleware
+      # and the login loop never terminates. This is the single most common
+      # forward-auth deadlock; see each app's labels.
+      - "traefik.http.services.authentik-outpost.loadbalancer.server.url=http://authentik-server:9000"
+
+      # ── Authentik itself (sso.ghoulhub.uk) ─────────────────────────────────
+      # Authentik is the identity provider, so it must NEVER sit behind its own
+      # forward-auth middleware. That is the rule-9 deadlock: the login page
+      # would demand a login to reach the login page, and if Authentik is the
+      # thing that is broken there would be no way in at all. It gets the
+      # security headers and the rate limit — a login endpoint is exactly where
+      # a rate limit earns its keep — but no authentication of its own.
+      #
+      # No companion outpost router is needed here: this router matches every
+      # path on the host, so /outpost.goauthentik.io/callback (the redirect_uri
+      # every app's login sends the browser back to) is already forwarded.
+      - "traefik.http.services.authentik-server.loadbalancer.server.url=http://authentik-server:9000"
+      - "traefik.http.routers.sso.rule=Host(`sso.ghoulhub.uk`)"
+      - "traefik.http.routers.sso.entrypoints=websecure"
+      - "traefik.http.routers.sso.tls.certresolver=le"
+      - "traefik.http.routers.sso.priority=10"
+      - "traefik.http.routers.sso.service=authentik-server"
+      - "traefik.http.routers.sso.middlewares=security-headers,rate-limit"
 
 networks:
-  traefik:
+  proxy:
     external: true
