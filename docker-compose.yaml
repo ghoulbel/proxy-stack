@@ -50,13 +50,26 @@ services:
       - "traefik.http.routers.dashboard.tls.certresolver=le"
       - "traefik.http.routers.dashboard.service=api@internal"
       - "traefik.http.routers.dashboard.priority=5"
-      - "traefik.http.routers.dashboard.middlewares=authentik-forwardauth,dashboard-auth,security-headers,rate-limit"
+      # MIDDLEWARE ORDER IS LOAD-BEARING. Traefik runs middlewares left to right
+      # and stops at the first one that ends the request. The short-circuiting
+      # ones (rate-limit, forwardauth, basicauth) must therefore come LAST, or
+      # they never see the request.
+      #
+      # This router had forward-auth first and rate-limit last. Every anonymous
+      # visitor was 302'd straight to Authentik without ever passing the rate
+      # limiter, so the limiter protected nothing — the same ordering bug
+      # previously found and fixed on pipstory, openwebui and jellyseerr, and
+      # missed here. Now the unauthenticated request that triggers the 302 is
+      # the one that gets counted, exactly as everywhere else.
+      #
+      # Forward-auth must still beat dashboard-auth: an anonymous visitor should
+      # get the SSO login, not a password prompt for an account they have no
+      # Authentik identity for. Both sit after rate-limit, so neither escapes it.
+      - "traefik.http.routers.dashboard.middlewares=rate-limit,security-headers,authentik-forwardauth,dashboard-auth"
       # The dashboard is exposed through the public Cloudflare Tunnel so it is
       # reachable from anywhere without per-device DNS overrides. That makes
       # forward-auth mandatory, not optional: basic auth alone would be the only
       # thing standing between the internet and the full router/middleware API.
-      # forwardauth runs first so an anonymous visitor gets the SSO login rather
-      # than a password prompt for an account they do not have yet.
       - "traefik.http.middlewares.dashboard-auth.basicauth.users=${DASHBOARD_USER}:${DASHBOARD_PASSWORD_HASH}"
 
       # ── Shared middlewares ────────────────────────────────────────────────
