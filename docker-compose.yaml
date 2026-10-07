@@ -78,6 +78,34 @@ services:
       - "traefik.http.middlewares.rate-limit.rateLimit.burst=100"
       - "traefik.http.middlewares.rate-limit.rateLimit.period=1m"
 
+      # ── Per-app gate for Pip (the children's story app) ───────────────────
+      # Pip deliberately does NOT use authentik-forwardauth, and the reason is
+      # a property of forward-auth rather than of Pip:
+      #
+      # forward-auth asks Authentik "may this session pass the gate?" and the
+      # gate provider authorises anyone holding a valid Authentik session.
+      # There is no per-app scoping in that path — the browser session is
+      # shared across every subdomain via cookie_domain .ghoulhub.uk. So any
+      # account that can open Pip could then open Grafana (host metrics and
+      # dashboards) and Embrace (private letters between partners).
+      #
+      # Giving each child their own Authentik account does not fix that, and
+      # TOTP is unusable for a child anyway. Basic auth is scoped to the one
+      # router, needs no IdP account, and is revocable per person.
+      #
+      # This is a deliberate, documented exception to "Authentik for every
+      # human-facing service". Pip holds no personal data and its only cost
+      # is LLM tokens.
+      #
+      # Users come from THIS stack's .env as PIP_AUTH_USERS — a comma
+      # separated htpasswd list, stored here because the middleware is
+      # defined here. To add or remove a person, edit that value and run:
+      # docker compose up -d
+      # Generate a hash with:
+      #   docker run --rm httpd:alpine htpasswd -nbBC 10 <name> <password>
+      # Remember that every '$' must be doubled in a .env file.
+      - "traefik.http.middlewares.pipstory-auth.basicauth.users=${PIP_AUTH_USERS}"
+
       # ── Authentik forward-auth ─────────────────────────────────────────────
       # The embedded outpost lives inside the authentik-server container, so
       # there is no separate proxy container to point at. `authentik-server`
