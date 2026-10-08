@@ -21,6 +21,7 @@ services:
     networks:
       - proxy
     restart: unless-stopped
+    mem_limit: 256m
     healthcheck:
       test: ["CMD", "traefik", "healthcheck", "--ping"]
       interval: 30s
